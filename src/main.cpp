@@ -2,6 +2,7 @@
 #include <bitset>
 #include <U8g2lib.h>
 #include <math.h>
+#include <STM32FreeRTOS.h>
 
 //Constants
 const uint32_t interval = 100; //Display update interval
@@ -12,23 +13,23 @@ const int index_a = 10;
 volatile uint32_t currentStepSize;
 volatile int note_string_index;
 std::string note_string;
-  
+
+
+struct {
+std::bitset<32> inputs;  
+} sysState;
   
 //rows of the matrix
 const int num_cols = 32;
   
 constexpr uint32_t step_size(uint32_t f) {
-  long res = (pow(2, 32)) * f / sample_rate;
-  return (uint32_t)res;
+  uint32_t scalar = (pow(2, 32)) / sample_rate;
+  return  scalar * f;
 }
 
 constexpr uint32_t construct_step_sizes(int index) {
-  //not allowed to use "note spacing" variable
-  //uint32_t frequency = freq_a + ( (index - index_a) * ( freq_a * 2 - freq_a ) );
-  uint32_t frequency = 440;
+  uint32_t frequency = (int32_t)(freq_a * pow(2, (index - index_a) / 12.0)); //shift by 12 (divide by 2, 12 times)
   return step_size(frequency);
-
-
 }
 
 
@@ -110,12 +111,75 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value) {
 //isr = interrupt service routine
 void sampleISR() {
   static uint32_t phaseAcc = 0;
+  //Serial.println(currentStepSize);
   phaseAcc += currentStepSize;
   int32_t Vout = (phaseAcc >> 24) - 128;
   analogWrite(OUTR_PIN, Vout + 128);
 }
 
+void setRow(uint8_t rowIdx){
+  
+  digitalWrite(REN_PIN, LOW);
+  delayMicroseconds(3);
+  switch(rowIdx) {
 
+    case 0: {   digitalWrite(RA2_PIN, LOW);    digitalWrite(RA1_PIN, LOW);    digitalWrite(RA0_PIN, LOW);  break;  } //0
+    case 1: {   digitalWrite(RA2_PIN, LOW);    digitalWrite(RA1_PIN, LOW);    digitalWrite(RA0_PIN, HIGH); break;  } //1
+    case 2: {   digitalWrite(RA2_PIN, LOW);    digitalWrite(RA1_PIN, HIGH);   digitalWrite(RA0_PIN, LOW);  break;  } //2
+    case 3: {   digitalWrite(RA2_PIN, LOW);    digitalWrite(RA1_PIN, HIGH);   digitalWrite(RA0_PIN, HIGH); break;  } //3
+    case 4: {   digitalWrite(RA2_PIN, HIGH);   digitalWrite(RA1_PIN, LOW);    digitalWrite(RA0_PIN, LOW);  break;  } //4
+    case 5: {   digitalWrite(RA2_PIN, HIGH);   digitalWrite(RA1_PIN, LOW);    digitalWrite(RA0_PIN, HIGH); break;  } //5
+    case 6: {   digitalWrite(RA2_PIN, HIGH);   digitalWrite(RA1_PIN, HIGH);   digitalWrite(RA0_PIN, LOW);  break;  } //6
+    case 7: {   digitalWrite(RA2_PIN, HIGH);   digitalWrite(RA1_PIN, HIGH);   digitalWrite(RA0_PIN, HIGH); break;  } //7
+
+    default:{   digitalWrite(RA2_PIN, LOW);    digitalWrite(RA1_PIN, LOW);    digitalWrite(RA0_PIN, HIGH);    } //default
+  }
+
+  digitalWrite(REN_PIN, HIGH);
+
+
+}
+  
+std::bitset<num_cols> readCols(){
+  //Write a function that will read the inputs from the four columns of the 
+  //switch matrix (C0, C1, C2, C3) and return the four bits as a 
+  //C++ bitset, which is a fixed-sized vector of Booleans.
+  std::bitset<num_cols> result; 
+  note_string = "";
+
+  uint32_t localCurrentStepSize = 0;
+  __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
+  for (int i = 0; i < 3; i++) {
+    
+    setRow((uint8_t)i);
+    result[(4 * i) + 0] = digitalRead(C0_PIN);
+    if (!digitalRead(C0_PIN)) {note_string = note_string + names[(4 * i) + 0] + " "; localCurrentStepSize = stepSizes[(4 * i) + 0];}
+    result[(4 * i) + 1] = digitalRead(C1_PIN);
+    if (!digitalRead(C1_PIN)) {note_string = note_string + names[(4 * i) + 1] + " "; localCurrentStepSize = stepSizes[(4 * i) + 1];}
+    result[(4 * i) + 2] = digitalRead(C2_PIN);
+    if (!digitalRead(C2_PIN)) {note_string = note_string + names[(4 * i) + 2] + " "; localCurrentStepSize = stepSizes[(4 * i) + 2];}
+    result[(4 * i) + 3] = digitalRead(C3_PIN);
+    if (!digitalRead(C3_PIN)) {note_string = note_string + names[(4 * i) + 3] + " "; localCurrentStepSize = stepSizes[(4 * i) + 3];}
+
+  }
+  // for (int i = 0; i < sizeof(stepSizes) / sizeof(stepSizes[0]); ++i) {
+  //   Serial.println(result[i]);
+  // }
+  //Serial.println(localCurrentStepSize);
+  __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
+  return result;
+
+} 
+
+
+void scanKeysTask(void * pvParameters) {
+  const TickType_t xFrequency = 50/portTICK_PERIOD_MS;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  while (1) {
+    vTaskDelayUntil( &xLastWakeTime, xFrequency );
+    sysState.inputs = readCols();
+  }
+}
 
 void setup() {
   // put your setup code here, to run once:
@@ -153,62 +217,33 @@ void setup() {
   sampleTimer->setOverflow(22000, HERTZ_FORMAT);
   sampleTimer->attachInterrupt(sampleISR);
   sampleTimer->resume();
-
-
-}
-
-
-
-void setRow(uint8_t rowIdx){
-  
-  digitalWrite(REN_PIN, LOW);
-  delayMicroseconds(3);
-  switch(rowIdx) {
-
-    case 0: {   digitalWrite(RA2_PIN, LOW);    digitalWrite(RA1_PIN, LOW);    digitalWrite(RA0_PIN, LOW);  break;  } //0
-    case 1: {   digitalWrite(RA2_PIN, LOW);    digitalWrite(RA1_PIN, LOW);    digitalWrite(RA0_PIN, HIGH); break;  } //1
-    case 2: {   digitalWrite(RA2_PIN, LOW);    digitalWrite(RA1_PIN, HIGH);   digitalWrite(RA0_PIN, LOW);  break;  } //2
-    case 3: {   digitalWrite(RA2_PIN, LOW);    digitalWrite(RA1_PIN, HIGH);   digitalWrite(RA0_PIN, HIGH); break;  } //3
-    case 4: {   digitalWrite(RA2_PIN, HIGH);   digitalWrite(RA1_PIN, LOW);    digitalWrite(RA0_PIN, LOW);  break;  } //4
-    case 5: {   digitalWrite(RA2_PIN, HIGH);   digitalWrite(RA1_PIN, LOW);    digitalWrite(RA0_PIN, HIGH); break;  } //5
-    case 6: {   digitalWrite(RA2_PIN, HIGH);   digitalWrite(RA1_PIN, HIGH);   digitalWrite(RA0_PIN, LOW);  break;  } //6
-    case 7: {   digitalWrite(RA2_PIN, HIGH);   digitalWrite(RA1_PIN, HIGH);   digitalWrite(RA0_PIN, HIGH); break;  } //7
-
-    default:         {   digitalWrite(RA2_PIN, LOW);    digitalWrite(RA1_PIN, LOW);    digitalWrite(RA0_PIN, HIGH);    } //default
-  }
-
-  digitalWrite(REN_PIN, HIGH);
-
-
-}
-  
-std::bitset<num_cols> readCols(){
-  //Write a function that will read the inputs from the four columns of the 
-  //switch matrix (C0, C1, C2, C3) and return the four bits as a 
-  //C++ bitset, which is a fixed-sized vector of Booleans.
-  std::bitset<num_cols> result; 
-  note_string = "";
+  /*
   for (int i = 0; i < sizeof(stepSizes) / sizeof(stepSizes[0]); ++i) {
     Serial.println(stepSizes[i]);
+  }
+
+
+
+  for (int i = 0; i < sizeof(stepSizes) / sizeof(stepSizes[0]); ++i) {
+    Serial.println((float)((i - index_a)/ 12.0));
+    Serial.println((int32_t)(freq_a * pow(2, (i - index_a) / 12.0))); //shift by 12 (divide by 2, 12 times));
+  }
+  */
+
+  TaskHandle_t scanKeysHandle = NULL;
+  xTaskCreate(
+    scanKeysTask,		/* Function that implements the task */
+    "scanKeys",		/* Text name for the task */
+    64,      		/* Stack size in words, not bytes */
+    NULL,			/* Parameter passed into the task */
+    1,			/* Task priority */
+    &scanKeysHandle 
+  );	/* Pointer to store the task handle */
+  vTaskStartScheduler();
 }
 
-  currentStepSize = 0;
-  for (int i = 0; i < 3; i++) {
-    
-    setRow((uint8_t)i);
-    result[(4 * i) + 0] = digitalRead(C0_PIN);
-    if (!digitalRead(C0_PIN)) {note_string = note_string + names[(4 * i) + 0] + " "; currentStepSize = step_size((4 * i) + 0);}
-    result[(4 * i) + 1] = digitalRead(C1_PIN);
-    if (!digitalRead(C1_PIN)) {note_string = note_string + names[(4 * i) + 1] + " "; currentStepSize = step_size((4 * i) + 1);}
-    result[(4 * i) + 2] = digitalRead(C2_PIN);
-    if (!digitalRead(C2_PIN)) {note_string = note_string + names[(4 * i) + 2] + " "; currentStepSize = step_size((4 * i) + 2);}
-    result[(4 * i) + 3] = digitalRead(C3_PIN);
-    if (!digitalRead(C3_PIN)) {note_string = note_string + names[(4 * i) + 3] + " "; currentStepSize = step_size((4 * i) + 3);}
 
-  }
-  return result;
 
-} 
 
 void loop() {
   // put your main code here, to run repeatedly:
@@ -216,14 +251,8 @@ void loop() {
   static uint32_t count = 0;
   while (millis() < next);  //Wait for next interval
   next += interval;
-
-  //std::bitset<32> inputs;
-  //Serial.println("Collecting Input");
-  //int inint = (int)(inputs.to_ulong());
-  //Serial.println(inint);
-
-  std::bitset<num_cols> inputs = readCols();
-
+  //scanKeysTask(NULL);
+  //sysState.inputs = readCols();
 
 
 
@@ -234,7 +263,7 @@ void loop() {
   u8g2.drawStr(2,10,"Helllo World!");  // write something to the internal memory
   //u8g2.print(count++);
   u8g2.setCursor(2,20);
-  u8g2.print(inputs.to_ulong(),BIN);
+  u8g2.print(sysState.inputs.to_ulong(),BIN);
   //u8g2.print(inputs.to_string()); 
 
   u8g2.setFont(u8g2_font_ncenB08_tr); // choose a suitable font
